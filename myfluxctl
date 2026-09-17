@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""myfluxctl - inspect and override the myfluxd schedule.
+
+    myfluxctl status            what is active right now
+    myfluxctl off               stop all effects until further notice
+    myfluxctl off 45m           stop all effects for a while, then resume
+    myfluxctl off next          ...until the next schedule boundary
+    myfluxctl on                resume the automatic schedule
+    myfluxctl toggle            off if on, on if off
+    myfluxctl loc [ams|nyc|...] show or switch location
+    myfluxctl reset             emergency restore, works with myfluxd stopped
+"""
+
+import os, sys, time, json, signal, subprocess
+from pathlib import Path
+
+HOME     = Path.home()
+CONF_DIR = HOME / ".config" / "myflux"
+OVERRIDE = CONF_DIR / "override"
+STATE    = CONF_DIR / "state"
+BIN      = HOME / "bin"
+MYFLUX   = BIN / "myflux"
+
+
+def _is_daemon(pid):
+    """Verify a pid really is myfluxd before signalling it. A loose
+    `pgrep -f myfluxd` also matches any shell, editor or journalctl whose
+    command line mentions the name, and SIGHUP to those is destructive."""
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return any(os.path.basename(a.decode("utf-8", "replace")) == "myfluxd"
+               for a in cmd if a)
+
+
+def daemon_pids():
+    pids = []
+    try:                                   # authoritative: written by the daemon
+        pids.append(int(json.loads(STATE.read_text()).get("pid", 0)))
+    except Exception:
+        pass
+    try:                                   # fallback: ask systemd
+        out = subprocess.run(["systemctl", "--user", "show", "-p", "MainPID",
+                              "--value", "myfluxd.service"],
+                             capture_output=True, text=True, timeout=10).stdout
+        pids.append(int(out.strip() or 0))
+    except Exception:
+        pass
+    return [p for p in dict.fromkeys(pids) if _is_daemon(p)]
+
+
+def poke():
+    """Ask the daemon to re-evaluate now instead of waiting for its tick."""
+    pids = daemon_pids()
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGHUP)
+        except OSError:
+            pass
+    if not pids:
+        print("note: myfluxd is not running (systemctl --user start myfluxd)")
+
+
+def next_boundary_ts():
+    """When the schedule next changes. Read from the daemon's state rather
+    than hardcoded here, so the window stays defined in exactly one place."""
+    st = json.loads(STATE.read_text())
+    now = time.localtime()
+    n = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+    best = None
+    for hm in st["grey_window"].split("-"):
+        h, m = hm.split(":")
+        delta = ((int(h) * 3600 + int(m) * 60) - n) % 86400 or 86400
+        best = delta if best is None else min(best, delta)
+    return time.time() + best
+
+
+def parse_duration(s):
+    s = s.strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600}
+    if s and s[-1] in mult:
+        return float(s[:-1]) * mult[s[-1]]
+    return float(s) * 60          # bare number means minutes
+
+
+def cmd_status():
+    try:
+        st = json.loads(STATE.read_text())
+    except OSError:
+        print("myfluxd has not written state yet")
+        st = {}
+    running = "running" if daemon_pids() else "NOT running"
+    phase = st.get("phase", "?")
+    desc = {"grey":    "greyscale + dimming (redshift stopped)",
+            "auto":    "automatic - redshift owns the screen",
+            "off":     "overridden - full colour and brightness",
+            "stopped": "daemon stopped"}.get(phase, phase)
+    print(f"daemon      : {running}")
+    print(f"phase       : {phase} - {desc}")
+    print(f"greyscale   : {st.get('grey', '?')} "
+          f"(window {st.get('grey_window','?')}, "
+          f"brightness {st.get('grey_brightness','?')})")
+    print(f"location    : {st.get('location','?')}")
+    until = st.get("override_until")
+    if until:
+        print(f"override    : until {time.strftime('%H:%M:%S', time.localtime(until))}")
+    elif phase == "off":
+        print("override    : indefinite (myfluxctl on to resume)")
+    if st.get("changed"):
+        age = time.time() - st["changed"]
+        print(f"last change : {age:.0f}s ago")
+
+
+def cmd_off(args):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    if args:
+        if args[0] == "next":
+            try:
+                until = next_boundary_ts()
+            except (OSError, KeyError, ValueError):
+                print("cannot read the schedule; is myfluxd running?",
+                      file=sys.stderr)
+                return 1
+        else:
+            until = time.time() + parse_duration(args[0])
+        OVERRIDE.write_text(f"off {until}\n")
+        print("effects off until "
+              f"{time.strftime('%H:%M:%S', time.localtime(until))}")
+    else:
+        OVERRIDE.write_text("off\n")
+        print("effects off until 'myfluxctl on'")
+    poke()
+
+
+def override_active():
+    """Whether an override is in force, read from the override file rather
+    than the daemon's published phase. myfluxctl writes that file itself, so
+    it is correct immediately; the daemon's phase lags by up to a tick."""
+    try:
+        txt = OVERRIDE.read_text().strip()
+    except OSError:
+        return False
+    if not txt.startswith("off"):
+        return False
+    parts = txt.split()
+    if len(parts) > 1:
+        try:
+            return time.time() < float(parts[1])
+        except ValueError:
+            return True
+    return True
+
+
+def cmd_toggle(args):
+    """Convenient for a tray middle-click or an i3 keybinding."""
+    return cmd_on() if override_active() else cmd_off(args)
+
+
+def cmd_on():
+    try:
+        OVERRIDE.unlink()
+    except FileNotFoundError:
+        pass
+    print("automatic schedule resumed")
+    poke()
+
+
+def cmd_loc(args):
+    if not args:
+        try:
+            print(f"current: {os.readlink(MYFLUX)}")
+        except OSError:
+            print(f"{MYFLUX} is not a symlink")
+        avail = sorted(p.name.removeprefix("myflux-") for p in BIN.glob("myflux-*"))
+        print("available:", " ".join(avail))
+        return
+    name = args[0]
+    target = f"myflux-{name}"
+    if not (BIN / target).exists():
+        print(f"no such location script: {BIN / target}", file=sys.stderr)
+        return 1
+    tmp = BIN / ".myflux.tmp"
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    os.symlink(target, tmp)
+    os.replace(tmp, MYFLUX)       # atomic; daemon picks it up next tick
+    print(f"location -> {target}")
+    poke()
+
+
+def cmd_reset():
+    """Escape hatch that does not need the daemon."""
+    env = dict(os.environ, DISPLAY=os.environ.get("DISPLAY", ":0.0"))
+    subprocess.run(["pkill", "-u", str(os.getuid()), "-x", "redshift"])
+    subprocess.run(["redshift", "-x"], env=env,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ctmset = next((p for p in (BIN / "ctmset", HOME / "src" / "myflux" / "ctmset")
+                   if p.is_file() and os.access(p, os.X_OK)), None)
+    if ctmset:
+        out = subprocess.run(["xrandr", "--query"], env=env,
+                             capture_output=True, text=True).stdout
+        for l in out.splitlines():
+            f = l.split()
+            if len(f) >= 2 and f[1] == "connected":
+                subprocess.run([str(ctmset), f[0], "1", "0", "0", "0", "1",
+                                "0", "0", "0", "1"], env=env,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+    print("gamma and CTM reset to identity; redshift stopped")
+    print("note: myfluxd will reassert the schedule on its next tick "
+          "(stop it with: systemctl --user stop myfluxd)")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if   cmd == "status": return cmd_status()
+    elif cmd == "off":    return cmd_off(args)
+    elif cmd == "on":     return cmd_on()
+    elif cmd == "toggle": return cmd_toggle(args)
+    elif cmd == "loc":    return cmd_loc(args)
+    elif cmd == "reset":  return cmd_reset()
+    print(f"unknown command: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)

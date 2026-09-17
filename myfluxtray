@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+myflux-tray - StatusNotifierItem indicator for myfluxd.
+
+Fully event-driven: there is no polling loop. The daemon publishes
+~/.config/myflux/state only when something actually changes, and this watches
+that directory with inotify (GFileMonitor), so an idle night costs no wakeups.
+Daemon liveness is re-checked when the menu is opened, which is user-driven
+and therefore also free when idle.
+
+The panel here (xfce4-panel's libsystray) speaks StatusNotifierItem and there
+is no XEmbed tray, so AppIndicator is the only option; Gtk.StatusIcon would
+silently do nothing.
+"""
+
+import gi, json, os, subprocess, sys, time
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import Gtk, GLib, Gio, AyatanaAppIndicator3 as AI
+from pathlib import Path
+
+CONF  = Path.home() / ".config" / "myflux"
+STATE = CONF / "state"
+BIN   = Path.home() / "bin"
+CTL   = str(BIN / "myfluxctl")
+DEBUG = bool(os.environ.get("MYFLUX_TRAY_DEBUG"))
+
+ICON = {
+    "grey":    "night-light-symbolic",
+    "auto":    "display-brightness-symbolic",
+    "off":     "night-light-disabled-symbolic",
+    "stopped": "night-light-disabled-symbolic",
+    "unknown": "night-light-disabled-symbolic",
+}
+BLURB = {
+    "grey":    "Greyscale + dimming",
+    "auto":    "Automatic (redshift)",
+    "off":     "Effects off",
+    "stopped": "Daemon stopped",
+    "unknown": "Daemon not running",
+}
+
+
+def ctl(*args):
+    try:
+        subprocess.run([CTL, *args], timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"myflux-tray: {CTL} {' '.join(args)} failed: {e}", file=sys.stderr)
+
+
+def read_state():
+    """-> (state_dict, alive). `alive` is a pid check, no process spawn."""
+    try:
+        st = json.loads(STATE.read_text())
+    except Exception:
+        return {}, False
+    pid = st.get("pid", 0)
+    alive = bool(pid) and Path(f"/proc/{pid}").exists()
+    return st, alive
+
+
+def hhmm(ts):
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+class Tray:
+    def __init__(self):
+        self.ind = AI.Indicator.new("myflux", ICON["unknown"],
+                                    AI.IndicatorCategory.APPLICATION_STATUS)
+        self.ind.set_status(AI.IndicatorStatus.ACTIVE)
+        self.ind.set_title("myflux")
+        self.build_menu()
+        self.ind.set_menu(self.menu)
+        # Middle-click toggles; scroll is left alone.
+        self.ind.set_secondary_activate_target(self.mi_toggle)
+
+        self.pending = 0
+        mon = Gio.File.new_for_path(str(CONF)).monitor_directory(
+            Gio.FileMonitorFlags.WATCH_MOVES, None)
+        mon.connect("changed", self.on_change)
+        self.mon = mon                      # keep a reference alive
+        self.refresh()
+
+    # ---------------------------------------------------------------- menu
+    def build_menu(self):
+        self.menu = Gtk.Menu()
+
+        self.mi_status = Gtk.MenuItem(label="…")
+        self.mi_status.set_sensitive(False)
+        self.add(self.mi_status)
+        self.add(Gtk.SeparatorMenuItem())
+
+        self.mi_toggle = Gtk.MenuItem(label="Turn off")
+        self.mi_toggle.connect("activate", lambda *_: ctl("toggle"))
+        self.add(self.mi_toggle)
+
+        self.mi_next = Gtk.MenuItem(label="Pause until next change")
+        self.mi_next.connect("activate", lambda *_: ctl("off", "next"))
+        self.add(self.mi_next)
+
+        for label, arg in (("Pause 15 minutes", "15m"), ("Pause 1 hour", "1h")):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda _w, a=arg: ctl("off", a))
+            self.add(it)
+
+        self.mi_resume = Gtk.MenuItem(label="Resume automatic schedule")
+        self.mi_resume.connect("activate", lambda *_: ctl("on"))
+        self.add(self.mi_resume)
+
+        self.add(Gtk.SeparatorMenuItem())
+
+        self.mi_loc = Gtk.MenuItem(label="Location")
+        self.loc_menu = Gtk.Menu()
+        self.loc_items = {}
+        leader = None
+        for p in sorted(BIN.glob("myflux-*")):
+            name = p.name[len("myflux-"):]
+            it = Gtk.RadioMenuItem(label=name)
+            if leader is None:
+                leader = it
+            else:
+                it.join_group(leader)
+            it.connect("activate", self.on_loc, name)
+            it.show()
+            self.loc_menu.append(it)
+            self.loc_items[name] = it
+        self.mi_loc.set_submenu(self.loc_menu)
+        self.add(self.mi_loc)
+
+        self.add(Gtk.SeparatorMenuItem())
+        it = Gtk.MenuItem(label="Quit indicator")
+        it.connect("activate", lambda *_: Gtk.main_quit())
+        self.add(it)
+
+        # Liveness is only re-checked when the user opens the menu: correct
+        # when it matters, and free while idle.
+        self.menu.connect("show", lambda *_: self.refresh())
+
+    def add(self, item):
+        item.show()
+        self.menu.append(item)
+
+    def on_loc(self, widget, name):
+        if widget.get_active() and not self._loading:
+            ctl("loc", name)
+
+    # ------------------------------------------------------------- refresh
+    def on_change(self, *_):
+        if self.pending:
+            GLib.source_remove(self.pending)
+        self.pending = GLib.timeout_add(120, self._fire)
+
+    def _fire(self):
+        self.pending = 0
+        self.refresh()
+        return False
+
+    def refresh(self):
+        st, alive = read_state()
+        if DEBUG:
+            print(f"  [{time.strftime('%H:%M:%S')}] refresh: "
+                  f"phase={st.get('phase')} alive={alive} loc={st.get('location')}",
+                  flush=True)
+        phase = st.get("phase", "unknown") if alive else "unknown"
+        if phase not in ICON:
+            phase = "unknown"
+
+        self.ind.set_icon_full(ICON[phase], BLURB[phase])
+
+        line = BLURB[phase]
+        until = st.get("override_until")
+        if phase == "off" and until:
+            line += f" until {hhmm(until)}"
+        elif phase == "off":
+            line += " (indefinitely)"
+        elif phase in ("grey", "auto") and st.get("grey_window"):
+            a, b = st["grey_window"].split("-")
+            line += f" — next change {b if phase == 'grey' else a}"
+        self.mi_status.set_label(line)
+
+        overridden = phase == "off"
+        self.mi_toggle.set_label("Resume schedule" if overridden else "Turn off")
+        self.mi_resume.set_sensitive(overridden)
+        for it in (self.mi_next,):
+            it.set_sensitive(not overridden)
+
+        self._loading = True            # do not fire on_loc while syncing
+        cur = (st.get("location") or "")[len("myflux-"):]
+        if cur in self.loc_items:
+            self.loc_items[cur].set_active(True)
+        self._loading = False
+
+    _loading = False
+
+
+if __name__ == "__main__":
+    CONF.mkdir(parents=True, exist_ok=True)
+    Tray()
+    Gtk.main()

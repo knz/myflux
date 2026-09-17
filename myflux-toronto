@@ -1,0 +1,3 @@
+#! /bin/sh
+exec redshift -l 43.6529:-79.3849
+

@@ -1,0 +1,19 @@
+[Unit]
+Description=Nightly colour temperature and greyscale orchestration
+Documentation=man:redshift(1)
+
+[Service]
+Type=simple
+# lightdm does not activate graphical-session.target here, so the display is
+# named explicitly rather than inherited. ~/.Xauthority is the default path
+# and needs no XAUTHORITY.
+Environment=DISPLAY=:0.0
+ExecStart=%h/bin/myfluxd
+Restart=always
+RestartSec=5
+# Stopping the unit restores full colour and brightness (SIGTERM handler).
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

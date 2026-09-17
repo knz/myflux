@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+myfluxd - orchestrate redshift and a DRM CTM matrix on a fixed nightly schedule.
+
+    sunset -> 22:30    redshift (colour temperature + its own -b dimming)
+    22:30  -> 07:00    greyscale + dimming via CTM, redshift stopped
+    07:00  -> sunrise  redshift again
+
+Solar position is never computed here; redshift owns it entirely. This daemon
+knows only two wall-clock boundaries and enforces, on every tick:
+
+    redshift running  iff  outside the grey window (and not overridden)
+    CTM               ==   brightness * [(1-g)*I + g*luma]
+
+Every tick re-derives the wanted state from the wall clock rather than
+accumulating it, so suspending across a boundary is self-correcting. A clock
+jump larger than RESUME_DRIFT is treated as a resume: redshift is restarted
+(X can drop gamma ramps across DPMS/VT switches) and the CTM is reasserted.
+"""
+
+import os, sys, time, json, errno, select, signal, subprocess
+from pathlib import Path
+
+HOME     = Path.home()
+CONF_DIR = HOME / ".config" / "myflux"
+OVERRIDE = CONF_DIR / "override"
+STATE    = CONF_DIR / "state"
+MYFLUX   = HOME / "bin" / "myflux"          # symlink -> myflux-<location>
+
+def _hm(var, default):
+    v = os.environ.get(var)
+    if not v:
+        return default
+    h, m = v.split(":")
+    return (int(h), int(m))
+
+# Overridable via the environment so the unit can be retuned without editing
+# this file, and so the boundaries can be exercised in a test run.
+GREY_START      = _hm("MYFLUX_GREY_START", (22, 30))    # inclusive
+GREY_END        = _hm("MYFLUX_GREY_END",   ( 7,  0))    # exclusive
+GREY_BRIGHTNESS = float(os.environ.get("MYFLUX_GREY_BRIGHTNESS", "0.5"))
+LUMA            = (0.2126, 0.7152, 0.0722)   # Rec.709
+FADE_SECS       = 2.5           # matches redshift's own fade
+FADE_STEPS      = 25
+TICK            = 15.0
+RESUME_DRIFT    = 5.0
+
+DEVNULL = subprocess.DEVNULL
+
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def find_ctmset():
+    env = os.environ.get("MYFLUX_CTMSET")
+    cands = [Path(env)] if env else []
+    cands += [HOME / "bin" / "ctmset", HOME / "src" / "myflux" / "ctmset"]
+    for p in cands:
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+CTMSET = find_ctmset()
+
+
+# ---------------------------------------------------------------- schedule
+
+def _s(hm):      return hm[0] * 3600 + hm[1] * 60
+def _now(lt):    return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+
+def in_grey_window(lt):
+    n, a, b = _now(lt), _s(GREY_START), _s(GREY_END)
+    if a <= b:
+        return a <= n < b           # same-day window
+    return n >= a or n < b          # wraps midnight (the 22:30-07:00 default)
+
+def secs_to_boundary(lt):
+    n = _now(lt)
+    return min(((b - n) % 86400) or 86400 for b in (_s(GREY_START), _s(GREY_END)))
+
+
+# ---------------------------------------------------------------- override
+
+def read_override():
+    """-> (active, until_ts|None). Expired temporary overrides clear themselves."""
+    try:
+        txt = OVERRIDE.read_text().strip()
+    except OSError:
+        return False, None
+    if not txt.startswith("off"):
+        return False, None
+    parts = txt.split()
+    if len(parts) > 1:
+        try:
+            until = float(parts[1])
+        except ValueError:
+            return True, None
+        if time.time() >= until:
+            try:
+                OVERRIDE.unlink()
+            except OSError:
+                pass
+            log("temporary override expired; resuming automatic schedule")
+            return False, None
+        return True, until
+    return True, None
+
+
+# ---------------------------------------------------------------- CTM
+
+def connected_outputs():
+    try:
+        out = subprocess.run(["xrandr", "--query"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception as e:
+        log(f"xrandr query failed: {e}")
+        return []
+    return [l.split()[0] for l in out.splitlines()
+            if len(l.split()) >= 2 and l.split()[1] == "connected"]
+
+
+def grey_matrix(g):
+    b = 1.0 - g * (1.0 - GREY_BRIGHTNESS)       # lerp(1.0, GREY_BRIGHTNESS, g)
+    m = []
+    for r in range(3):
+        for c in range(3):
+            ident = 1.0 if r == c else 0.0
+            m.append(b * ((1.0 - g) * ident + g * LUMA[c]))
+    return m
+
+
+def apply_ctm(g, outputs):
+    if not CTMSET or not outputs:
+        return
+    args = ["%.6f" % v for v in grey_matrix(g)]
+    for o in outputs:
+        try:
+            subprocess.run([CTMSET, o] + args, stdout=DEVNULL, stderr=DEVNULL,
+                           timeout=10)
+        except Exception:
+            pass        # display may be gone (suspend); next tick reasserts
+
+
+def fade_ctm(frm, to, outputs):
+    if abs(to - frm) < 1e-6:
+        apply_ctm(to, outputs)
+        return
+    t0 = time.monotonic()
+    while True:
+        e = (time.monotonic() - t0) / FADE_SECS
+        if e >= 1.0:
+            break
+        apply_ctm(frm + (to - frm) * e, outputs)
+        time.sleep(FADE_SECS / FADE_STEPS)
+    apply_ctm(to, outputs)
+
+
+# ---------------------------------------------------------------- redshift
+
+class Redshift:
+    """Owns the redshift child. ~/bin/myflux execs redshift, so the pid we
+    spawn *is* redshift and SIGTERM reaches it directly (fading out)."""
+
+    def __init__(self):
+        self.proc = None
+        self.loc  = None
+
+    @staticmethod
+    def target_loc():
+        try:
+            return os.readlink(MYFLUX)
+        except OSError:
+            return None
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self):
+        if self.running():
+            return
+        self.loc = self.target_loc()
+        try:
+            self.proc = subprocess.Popen([str(MYFLUX)], stdout=DEVNULL,
+                                         stderr=DEVNULL)
+            log(f"redshift started ({self.loc})")
+        except OSError as e:
+            log(f"could not start {MYFLUX}: {e}")
+            self.proc = None
+
+    def signal_stop(self):
+        """SIGTERM without waiting, so its fade overlaps ours."""
+        if self.running():
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+
+    def reap(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+        self.proc = None
+
+    def stop(self):
+        self.signal_stop()
+        self.reap()
+
+
+def kill_strays(exclude_pid=None):
+    """SIGTERM any redshift we do not own (manual myflux runs, autostart)."""
+    try:
+        out = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "redshift"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return
+    for line in out.split():
+        pid = int(line)
+        if pid == exclude_pid or pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            log(f"terminated stray redshift pid {pid}")
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- state
+
+_last_state = None
+
+
+def write_state(phase, g, loc, override_until):
+    """Write only when something actually changed.
+
+    Rewriting every tick would make an inotify watcher (the tray) wake four
+    times a minute with nothing to report, which defeats the point of watching
+    rather than polling. `changed` is therefore the time of the last real
+    change, not a heartbeat - liveness is the pid, which myfluxctl verifies.
+    """
+    global _last_state
+    payload = {
+        "pid": os.getpid(),
+        "phase": phase, "grey": round(g, 4), "location": loc,
+        "grey_window": f"{GREY_START[0]:02d}:{GREY_START[1]:02d}-"
+                       f"{GREY_END[0]:02d}:{GREY_END[1]:02d}",
+        "grey_brightness": GREY_BRIGHTNESS,
+        "override_until": override_until,
+    }
+    if payload == _last_state and STATE.exists():
+        return
+    try:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(dict(payload, changed=time.time())))
+        tmp.replace(STATE)
+        _last_state = payload
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- main loop
+
+def main():
+    if CTMSET is None:
+        log("fatal: ctmset not found (tried $MYFLUX_CTMSET, ~/bin/ctmset, "
+            "~/src/myflux/ctmset)")
+        return 1
+    if not MYFLUX.exists():
+        log(f"fatal: {MYFLUX} missing - symlink it to a myflux-<loc> script")
+        return 1
+    log(f"myfluxd starting: ctmset={CTMSET} grey="
+        f"{GREY_START[0]:02d}:{GREY_START[1]:02d}-{GREY_END[0]:02d}:{GREY_END[1]:02d} "
+        f"brightness={GREY_BRIGHTNESS}")
+
+    # Wake on signals without racing the sleep (PEP 475 retries bare sleeps).
+    rfd, wfd = os.pipe()
+    os.set_blocking(wfd, False)
+    os.set_blocking(rfd, False)
+    signal.set_wakeup_fd(wfd)
+    stopping = []
+    signal.signal(signal.SIGHUP,  lambda s, f: None)
+    signal.signal(signal.SIGTERM, lambda s, f: stopping.append(True))
+    signal.signal(signal.SIGINT,  lambda s, f: stopping.append(True))
+
+    rs = Redshift()
+    kill_strays()
+
+    cur_g    = None          # unknown until first apply
+    last_wall, last_mono = time.time(), time.monotonic()
+
+    while not stopping:
+        lt       = time.localtime()
+        over, until = read_override()
+        grey     = in_grey_window(lt)
+        want_g   = 0.0 if over else (1.0 if grey else 0.0)
+        want_rs  = (not over) and (not grey)
+
+        # A clock jump the monotonic clock did not see means we resumed.
+        wall, mono = time.time(), time.monotonic()
+        resumed = (wall - last_wall) - (mono - last_mono) > RESUME_DRIFT
+        last_wall, last_mono = wall, mono
+        if resumed:
+            log("resume detected - restarting redshift and reasserting CTM")
+            rs.stop()
+            cur_g = None
+
+        # Location switched by re-pointing the ~/bin/myflux symlink.
+        if rs.running() and rs.target_loc() != rs.loc:
+            log(f"location changed {rs.loc} -> {rs.target_loc()}")
+            rs.stop()
+
+        # Publish intent before the ~2.5s fade rather than after it, so a UI
+        # watching this file reacts when the command lands, not when the
+        # animation ends. The post-transition write below is then a no-op,
+        # because write_state only writes on change.
+        write_state("off" if over else ("grey" if grey else "auto"),
+                    want_g, rs.target_loc(), until)
+
+        outputs = connected_outputs()
+
+        if want_rs and not rs.running():
+            kill_strays()
+            rs.start()
+        elif not want_rs and rs.running():
+            rs.signal_stop()            # fades out over ~2.5s, concurrently
+
+        if cur_g is None:
+            apply_ctm(want_g, outputs)  # first run / post-resume: no fade
+            cur_g = want_g
+        elif abs(cur_g - want_g) > 1e-6:
+            fade_ctm(cur_g, want_g, outputs)
+            cur_g = want_g
+        elif want_g > 0:
+            apply_ctm(want_g, outputs)  # reassert: self-heals VT switch/hotplug
+
+        if not want_rs:
+            rs.reap()
+
+        phase = "off" if over else ("grey" if grey else "auto")
+        write_state(phase, cur_g, rs.target_loc(), until)
+
+        delay = min(TICK, max(1.0, secs_to_boundary(time.localtime())))
+        try:
+            r, _, _ = select.select([rfd], [], [], delay)
+            if r:
+                try:
+                    os.read(rfd, 4096)
+                except OSError:
+                    pass
+        except (OSError, InterruptedError):
+            pass
+
+    log("shutting down: restoring full colour and brightness")
+    rs.stop()
+    apply_ctm(0.0, connected_outputs())
+    write_state("stopped", 0.0, rs.target_loc(), None)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
