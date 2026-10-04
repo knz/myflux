@@ -4,6 +4,11 @@ Nightly screen colour management for X11 on amdgpu: redshift during the
 evening and early morning, plain greyscale plus dimming through the middle
 of the night.
 
+**Requirements:** [`redshift`](https://packages.debian.org/source/sid/redshift)
+must already be installed; myflux drives it rather than replacing it.
+
+![The myflux tray indicator with its menu open](doc/tray-menu.png)
+
 ## Schedule
 
 ```
@@ -86,6 +91,26 @@ redshift is restarted, because X can drop gamma ramps across DPMS and VT
 switches.
 
 ## Install
+
+Requirements (Debian package names):
+
+* **Display:** an X11 session on a GPU whose driver exposes the `CTM` output
+  property through RandR — amdgpu here. Wayland is not supported.
+* **Runtime:** [`redshift`](https://packages.debian.org/source/sid/redshift),
+  `python3`, `x11-xserver-utils` (for `xrandr`), `procps` (for `pkill`), and
+  a systemd user session.
+* **Build:** a C compiler and `make` (`build-essential`), `libx11-dev`,
+  `libxrandr-dev`.
+* **Tray (optional):** `python3-gi`, `gir1.2-gtk-3.0`,
+  `gir1.2-ayatanaappindicator3-0.1`, and a panel that hosts
+  StatusNotifierItem icons, such as `xfce4-panel`'s systray plugin (see
+  [Tray indicator](#tray-indicator)).
+
+```sh
+sudo apt install redshift python3 x11-xserver-utils procps \
+    build-essential libx11-dev libxrandr-dev \
+    python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+```
 
 ```sh
 make            # build ctmset and ctmget
@@ -231,24 +256,3 @@ mistake for a bug in `ctmset`, which is why `ctmget` exists.
 
 Runtime state lives in `~/.config/myflux/`: `state` (JSON, rewritten only when
 something changes) and `override` (present only while overridden).
-
-## Verified, and not
-
-Tested live: both boundary transitions and their fades; greyscale output
-genuinely neutral at 0.5 brightness; no clipping; permanent and timed
-overrides including auto-expiry; location switching without a manual kill;
-clean restore on stop; midnight-wrapping window logic.
-
-Also tested: the tray registers with the panel's StatusNotifierWatcher and
-refreshes exactly once per state change, with zero refreshes across 30 s of
-idle; `off next`, `toggle`, and the change-only state writes.
-
-Not yet exercised: a real suspend/resume cycle — the drift detection is
-sound in principle but unverified in practice; external-monitor hotplug, as
-only `eDP` was connected; and a full Amsterdam sunset → 22:30 redshift phase.
-How the symbolic icons actually read against a dark panel has not been
-judged — that needs eyes on it.
-
-```sh
-journalctl --user -u myfluxd -f    # watch it
-```
