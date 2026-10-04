@@ -2,3 +2,4 @@ ctmset
 ctmget
 *~
 \#*\#
+__pycache__/

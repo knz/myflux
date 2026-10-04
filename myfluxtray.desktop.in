@@ -2,7 +2,7 @@
 Type=Application
 Name=myflux indicator
 Comment=Tray status and controls for myfluxd
-Exec=@BIN@/myfluxtray
+Exec=/usr/bin/env MYFLUX_ICON_PAD=3 @BIN@/myfluxtray
 Icon=night-light-symbolic
 Terminal=false
 X-GNOME-Autostart-enabled=true

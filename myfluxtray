@@ -13,7 +13,7 @@ is no XEmbed tray, so AppIndicator is the only option; Gtk.StatusIcon would
 silently do nothing.
 """
 
-import gi, json, os, subprocess, sys, time
+import gi, json, os, re, shutil, subprocess, sys, time
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import Gtk, GLib, Gio, AyatanaAppIndicator3 as AI
@@ -24,6 +24,8 @@ STATE = CONF / "state"
 BIN   = Path.home() / "bin"
 CTL   = str(BIN / "myfluxctl")
 DEBUG = bool(os.environ.get("MYFLUX_TRAY_DEBUG"))
+ICON_PAD = int(os.environ.get("MYFLUX_ICON_PAD", "2"))
+ICON_DIR = Path.home() / ".cache" / "myflux" / "icons"
 
 ICON = {
     "grey":    "night-light-symbolic",
@@ -39,6 +41,80 @@ BLURB = {
     "stopped": "Daemon stopped",
     "unknown": "Daemon not running",
 }
+
+
+_SVG_TAG = re.compile(r"<svg\b[^>]*>", re.IGNORECASE)
+_ATTR    = re.compile(r'(\b%s\s*=\s*)"([^"]*)"' % "%s")
+
+
+def _num(v):
+    """'16px' / '16' / '16.0' -> float."""
+    return float(re.sub(r"[a-z%]+$", "", v.strip(), flags=re.I))
+
+
+def pad_svg(src, dst, pad):
+    """Widen an SVG canvas by `pad` units on the left and right, leaving the
+    artwork where it is.
+
+    A themed icon name carries no geometry, so the only way to give a tray
+    icon horizontal breathing room is to hand the panel a wider canvas. The
+    `-symbolic` suffix is kept on the output name so GTK still recolours it
+    to the panel foreground instead of baking in the source's grey.
+    """
+    text = src.read_text(encoding="utf-8")
+    m = _SVG_TAG.search(text)
+    if not m:
+        raise ValueError(f"no <svg> tag in {src}")
+    tag = m.group(0)
+
+    def attr(name):
+        mm = re.search(r'\b%s\s*=\s*"([^"]*)"' % name, tag, re.I)
+        return mm.group(1) if mm else None
+
+    w, h = attr("width"), attr("height")
+    vb   = attr("viewBox")
+    if vb:
+        x, y, vw, vh = (float(p) for p in re.split(r"[ ,]+", vb.strip()))
+    elif w and h:
+        x, y, vw, vh = 0.0, 0.0, _num(w), _num(h)   # no viewBox: user units are px
+    else:
+        raise ValueError(f"{src} has neither viewBox nor width/height")
+
+    new_tag = tag
+    def put(t_, name, value):
+        if re.search(r'\b%s\s*=\s*"[^"]*"' % name, t_, re.I):
+            return re.sub(r'(\b%s\s*=\s*)"[^"]*"' % name, lambda mo: mo.group(1) + '"%s"' % value,
+                          t_, count=1, flags=re.I)
+        return t_[:4] + ' %s="%s"' % (name, value) + t_[4:]     # after '<svg'
+
+    new_tag = put(new_tag, "viewBox", f"{x - pad} {y} {vw + 2 * pad} {vh}")
+    new_tag = put(new_tag, "width",  f"{vw + 2 * pad}")
+    new_tag = put(new_tag, "height", f"{vh}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(text[:m.start()] + new_tag + text[m.end():], encoding="utf-8")
+
+
+def build_icons(names, pad=ICON_PAD):
+    """-> {original name: name to hand the indicator}. Falls back to the
+    unpadded theme name for anything that cannot be rewritten."""
+    theme = Gtk.IconTheme.get_default()
+    out = {}
+    for n in names:
+        out[n] = n
+        if pad <= 0:
+            continue
+        try:
+            info = theme.lookup_icon(n, 22, 0)
+            src = Path(info.get_filename()) if info else None
+            if not src or src.suffix.lower() != ".svg":
+                continue                       # only SVG can be re-canvased
+            dst = ICON_DIR / f"myflux-{n}.svg"
+            pad_svg(src, dst, pad)
+            out[n] = f"myflux-{n}"
+        except Exception as e:
+            print(f"myflux-tray: cannot pad {n}: {e}", file=sys.stderr)
+    return out
 
 
 def ctl(*args):
@@ -66,8 +142,10 @@ def hhmm(ts):
 
 class Tray:
     def __init__(self):
-        self.ind = AI.Indicator.new("myflux", ICON["unknown"],
+        self.icon = build_icons(sorted(set(ICON.values())))
+        self.ind = AI.Indicator.new("myflux", self.icon[ICON["unknown"]],
                                     AI.IndicatorCategory.APPLICATION_STATUS)
+        self.ind.set_icon_theme_path(str(ICON_DIR))
         self.ind.set_status(AI.IndicatorStatus.ACTIVE)
         self.ind.set_title("myflux")
         self.build_menu()
@@ -166,7 +244,7 @@ class Tray:
         if phase not in ICON:
             phase = "unknown"
 
-        self.ind.set_icon_full(ICON[phase], BLURB[phase])
+        self.ind.set_icon_full(self.icon[ICON[phase]], BLURB[phase])
 
         line = BLURB[phase]
         until = st.get("override_until")
