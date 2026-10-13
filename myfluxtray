@@ -137,6 +137,7 @@ def read_state():
 
 
 def hhmm(ts):
+    time.tzset()        # pick up a changed /etc/localtime (see myfluxd)
     return time.strftime("%H:%M", time.localtime(ts))
 
 

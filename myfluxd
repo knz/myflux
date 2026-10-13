@@ -297,6 +297,10 @@ def main():
     last_wall, last_mono = time.time(), time.monotonic()
 
     while not stopping:
+        # localtime_r() never re-reads the zone, so without this a change of
+        # /etc/localtime (travel) would leave us on the old offset forever.
+        # glibc only reloads the file if it changed, so this is cheap.
+        time.tzset()
         lt       = time.localtime()
         over, until = read_override()
         grey     = in_grey_window(lt)
